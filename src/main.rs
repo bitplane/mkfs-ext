@@ -8,7 +8,11 @@ mod ext;
 use ext::Ext;
 
 #[derive(Parser)]
-#[command(name = "mkfs-ext", version, about = "Create original ext (pre-ext2) filesystem images")]
+#[command(
+    name = "mkfs-ext",
+    version,
+    about = "Create original ext (pre-ext2) filesystem images"
+)]
 struct Cli {
     /// Populate from this directory tree (recursive)
     #[arg(short = 'd', long)]

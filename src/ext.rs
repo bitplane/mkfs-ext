@@ -260,12 +260,7 @@ impl Ext {
         Ok(())
     }
 
-    fn add_dir_entry(
-        &mut self,
-        dir_ino: u32,
-        name: &str,
-        child_ino: u32,
-    ) -> anyhow::Result<()> {
+    fn add_dir_entry(&mut self, dir_ino: u32, name: &str, child_ino: u32) -> anyhow::Result<()> {
         let name_bytes = name.as_bytes();
         let name_len = name_bytes.len() as u16;
         let need = dir_rec_len(name_len);
@@ -288,15 +283,11 @@ impl Ext {
 
                 if slack >= need {
                     // Shrink the existing entry and write the new one in the slack.
-                    self.image[de_off + 4..de_off + 6]
-                        .copy_from_slice(&actual_len.to_le_bytes());
+                    self.image[de_off + 4..de_off + 6].copy_from_slice(&actual_len.to_le_bytes());
                     let new_off = de_off + actual_len as usize;
-                    self.image[new_off..new_off + 4]
-                        .copy_from_slice(&child_ino.to_le_bytes());
-                    self.image[new_off + 4..new_off + 6]
-                        .copy_from_slice(&slack.to_le_bytes());
-                    self.image[new_off + 6..new_off + 8]
-                        .copy_from_slice(&name_len.to_le_bytes());
+                    self.image[new_off..new_off + 4].copy_from_slice(&child_ino.to_le_bytes());
+                    self.image[new_off + 4..new_off + 6].copy_from_slice(&slack.to_le_bytes());
+                    self.image[new_off + 6..new_off + 8].copy_from_slice(&name_len.to_le_bytes());
                     self.image[new_off + 8..new_off + 8 + name_bytes.len()]
                         .copy_from_slice(name_bytes);
                     return Ok(());
@@ -312,8 +303,7 @@ impl Ext {
         }
         let new_block = self.alloc_block()?;
         self.inodes[(dir_ino - 1) as usize].zone[block_idx] = new_block;
-        self.inodes[(dir_ino - 1) as usize].size =
-            ((block_idx + 1) * BLOCK_SIZE) as u32;
+        self.inodes[(dir_ino - 1) as usize].size = ((block_idx + 1) * BLOCK_SIZE) as u32;
 
         let off = (new_block as usize) * BLOCK_SIZE;
         self.image[off..off + 4].copy_from_slice(&child_ino.to_le_bytes());
@@ -428,13 +418,7 @@ impl Ext {
         (next_chain, count_tot)
     }
 
-    fn write_efb(
-        &mut self,
-        block: u32,
-        count: u32,
-        free: &[u32; FREE_BLOCK_ENTRIES],
-        next: u32,
-    ) {
+    fn write_efb(&mut self, block: u32, count: u32, free: &[u32; FREE_BLOCK_ENTRIES], next: u32) {
         let off = (block as usize) * BLOCK_SIZE;
         for byte in self.image[off..off + BLOCK_SIZE].iter_mut() {
             *byte = 0;
@@ -476,7 +460,10 @@ impl Ext {
                 });
                 next_chain = ino;
             }
-            if current.as_ref().is_some_and(|c| c.count == FREE_INODE_ENTRIES as u32) {
+            if current
+                .as_ref()
+                .is_some_and(|c| c.count == FREE_INODE_ENTRIES as u32)
+            {
                 let c = current.take().unwrap();
                 count_tot += c.count + 1;
                 chains.push(c);
@@ -511,7 +498,7 @@ impl Ext {
         sb[24..28].copy_from_slice(&self.first_data_zone.to_le_bytes()); // s_firstdatazone
         sb[28..32].copy_from_slice(&0u32.to_le_bytes()); // s_log_zone_size
         sb[32..36].copy_from_slice(&max_size.to_le_bytes()); // s_max_size
-        // s_reserved[5] at 36..56 stays zero
+                                                             // s_reserved[5] at 36..56 stays zero
         sb[56..58].copy_from_slice(&MAGIC.to_le_bytes()); // s_magic (u16)
     }
 
