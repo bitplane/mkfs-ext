@@ -184,7 +184,6 @@ impl Ext {
                 src,
                 rustix::fs::OFlags::RDONLY
                     | rustix::fs::OFlags::DIRECTORY
-                    | rustix::fs::OFlags::NOFOLLOW
                     | rustix::fs::OFlags::CLOEXEC,
                 rustix::fs::Mode::empty(),
             )
@@ -205,16 +204,22 @@ impl Ext {
         #[cfg(unix)] dir: File,
     ) -> anyhow::Result<()> {
         #[cfg(unix)]
-        let meta = dir.metadata()?;
+        let meta = dir
+            .metadata()
+            .with_context(|| format!("reading source directory metadata {}", src_path.display()))?;
         #[cfg(not(unix))]
         let meta = fs::metadata(src_path)?;
         self.inodes[(dir_ino - 1) as usize].time = ext_timestamp(meta.modified()?)?;
         #[cfg(unix)]
-        let entries = rustix::fs::Dir::read_from(&dir)?;
+        let mut entries = rustix::fs::Dir::new(dir)
+            .with_context(|| format!("reading source directory {}", src_path.display()))?;
         #[cfg(not(unix))]
-        let entries = fs::read_dir(src_path)?;
-        for entry in entries {
-            let entry = entry?;
+        let mut entries = fs::read_dir(src_path)?;
+        // Unix child opens borrow the stream's fd between iterator steps.
+        #[cfg_attr(not(unix), allow(clippy::while_let_on_iterator))]
+        while let Some(entry) = entries.next() {
+            let entry = entry
+                .with_context(|| format!("reading source directory {}", src_path.display()))?;
             #[cfg(unix)]
             let raw_name = {
                 use std::os::unix::ffi::OsStrExt;
@@ -228,7 +233,7 @@ impl Ext {
             let raw_name = entry.file_name();
             let path = src_path.join(&raw_name);
             #[cfg(unix)]
-            let source = open_source_entry(&dir, &raw_name)
+            let source = open_source_entry(entries.fd()?, &raw_name)
                 .with_context(|| format!("importing {}", path.display()))?;
             #[cfg(unix)]
             let meta = source.metadata()?;
@@ -679,16 +684,16 @@ fn try_filled_vec<T: Clone>(len: usize, value: T) -> anyhow::Result<Vec<T>> {
 // Resolve each child relative to a pinned directory, never through a path
 // whose ancestors could have been replaced while walking the source tree.
 #[cfg(unix)]
-fn open_source_entry(dir: &File, name: &std::ffi::OsStr) -> anyhow::Result<File> {
+fn open_source_entry(dir: impl std::os::fd::AsFd, name: &std::ffi::OsStr) -> anyhow::Result<File> {
     use rustix::fs::{statat, AtFlags};
-    let expected = statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    let expected = statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
     open_checked_source(dir, name, &expected)
 }
 
 #[cfg(unix)]
 #[allow(clippy::unnecessary_cast)] // stat field widths differ between Unix targets.
 fn open_checked_source(
-    dir: &File,
+    dir: impl std::os::fd::AsFd,
     name: &std::ffi::OsStr,
     expected: &rustix::fs::Stat,
 ) -> anyhow::Result<File> {
@@ -698,7 +703,8 @@ fn open_checked_source(
     if kind != FileType::RegularFile && kind != FileType::Directory {
         anyhow::bail!("unsupported file type: {name:?}");
     }
-    let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let mut flags =
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOCTTY;
     if kind == FileType::Directory {
         flags |= OFlags::DIRECTORY;
     }
@@ -1092,6 +1098,22 @@ mod tests {
         assert_eq!(image.len(), BLOCK_SIZE);
         assert!(image.iter().all(|&byte| byte == 0));
         assert!(try_zeroed_image(usize::MAX).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicitly_selected_source_root_can_be_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let src = TempDir::new().unwrap();
+        let real = src.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("file"), b"data").unwrap();
+        let link = src.path().join("link");
+        symlink(&real, &link).unwrap();
+        let mut ext = Ext::new(1).unwrap();
+        ext.populate_root(&link).unwrap();
+        let ino = find_entry(&ext, ROOT_INO, b"file");
+        assert_eq!(ext.inodes[(ino - 1) as usize].size, 4);
     }
 
     // (No name-too-long smoke test here: NAME_LEN equals the typical host
