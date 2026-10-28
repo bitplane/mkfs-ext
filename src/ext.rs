@@ -188,12 +188,19 @@ impl Ext {
             let path = entry.path();
             let meta = fs::symlink_metadata(&path)?;
             let raw_name = entry.file_name();
+            #[cfg(unix)]
+            let name = {
+                use std::os::unix::ffi::OsStrExt;
+                raw_name.as_bytes()
+            };
+            #[cfg(not(unix))]
             let name = raw_name
                 .to_str()
-                .ok_or_else(|| anyhow::anyhow!("non-UTF8 filename: {:?}", raw_name))?;
+                .ok_or_else(|| anyhow::anyhow!("non-UTF8 filename: {:?}", raw_name))?
+                .as_bytes();
 
             if name.len() > NAME_LEN {
-                anyhow::bail!("name too long (max {NAME_LEN}): {name}");
+                anyhow::bail!("name too long (max {NAME_LEN}): {:?}", raw_name);
             }
             if !meta.is_file() && !meta.is_dir() {
                 anyhow::bail!("unsupported file type: {}", path.display());
@@ -289,8 +296,8 @@ impl Ext {
         Ok(())
     }
 
-    fn add_dir_entry(&mut self, dir_ino: u32, name: &str, child_ino: u32) -> anyhow::Result<()> {
-        let name_bytes = name.as_bytes();
+    fn add_dir_entry(&mut self, dir_ino: u32, name: &[u8], child_ino: u32) -> anyhow::Result<()> {
+        let name_bytes = name;
         let name_len = name_bytes.len() as u16;
         let need = dir_rec_len(name_len);
 
@@ -751,6 +758,26 @@ mod tests {
         assert_eq!(ext.inode_used.iter().filter(|&&used| used).count(), 3);
         let off = inode.zone[0] as usize * BLOCK_SIZE;
         assert_eq!(&ext.image[off..off + 7], b"payload");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_names_are_preserved_in_directories() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let src = TempDir::new().unwrap();
+        let name = OsStr::from_bytes(b"dir\xff");
+        fs::create_dir(src.path().join(name)).unwrap();
+        fs::write(
+            src.path().join(name).join(OsStr::from_bytes(b"file\xfe")),
+            b"bytes",
+        )
+        .unwrap();
+        let mut ext = Ext::new(1).unwrap();
+        ext.populate_root(src.path()).unwrap();
+        let dir = find_entry(&ext, ROOT_INO, name.as_bytes());
+        let file = find_entry(&ext, dir, b"file\xfe");
+        assert_eq!(ext.inodes[(file - 1) as usize].size, 5);
     }
 
     // (No name-too-long smoke test here: NAME_LEN equals the typical host
