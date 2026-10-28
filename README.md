@@ -39,7 +39,8 @@ sudo mount -o loop,ro -t ext out.ext /mnt
 ## Limits
 
 - Images are built in memory and limited to 512 MiB; allow additional RAM
-  for inode and allocation metadata. Allocation failures are reported as errors.
+  for inode and allocation metadata. Allocator-reported failures return errors;
+  operating-system memory limits can still terminate the process.
 
 - Imported modification times must fit ext's unsigned 32-bit Unix timestamp.
 - Unix imports preserve ownership and hard links between imported files.

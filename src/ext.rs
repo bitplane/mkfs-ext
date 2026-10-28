@@ -149,7 +149,7 @@ impl Ext {
         inode_used[ROOT_INO as usize] = true;
 
         let mut ext = Self {
-            image: try_filled_vec(image_len, 0u8)?,
+            image: try_zeroed_image(image_len)?,
             total_blocks,
             ninodes,
             first_data_zone,
@@ -648,6 +648,25 @@ fn checked_image_len(size_mb: u32) -> anyhow::Result<usize> {
     Ok(len)
 }
 
+fn try_zeroed_image(len: usize) -> anyhow::Result<Vec<u8>> {
+    use std::alloc::{alloc_zeroed, Layout};
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let layout =
+        Layout::array::<u8>(len).context("image size exceeds the host allocation limit")?;
+    // SAFETY: layout has nonzero size. A null result is handled before
+    // constructing the Vec. The global allocator supplies zero-initialized
+    // bytes, and the Vec uses the same allocation size and alignment.
+    let ptr = unsafe { alloc_zeroed(layout) };
+    if ptr.is_null() {
+        anyhow::bail!("not enough memory to allocate filesystem image");
+    }
+    // SAFETY: all len bytes are initialized, uniquely owned, and allocated
+    // using the global allocator with the layout Vec<u8> will deallocate.
+    Ok(unsafe { Vec::from_raw_parts(ptr, len, len) })
+}
+
 fn try_filled_vec<T: Clone>(len: usize, value: T) -> anyhow::Result<Vec<T>> {
     let mut values = Vec::new();
     values
@@ -1061,9 +1080,18 @@ mod tests {
     }
 
     #[test]
-    fn allocation_failure_is_reported_instead_of_panicking() {
+    fn allocation_capacity_errors_are_reported_instead_of_panicking() {
         let error = try_filled_vec(usize::MAX, 0u8).unwrap_err();
         assert!(error.to_string().contains("not enough memory"));
+    }
+
+    #[test]
+    fn image_allocation_is_zero_initialized_and_checks_capacity() {
+        assert!(try_zeroed_image(0).unwrap().is_empty());
+        let image = try_zeroed_image(BLOCK_SIZE).unwrap();
+        assert_eq!(image.len(), BLOCK_SIZE);
+        assert!(image.iter().all(|&byte| byte == 0));
+        assert!(try_zeroed_image(usize::MAX).is_err());
     }
 
     // (No name-too-long smoke test here: NAME_LEN equals the typical host
