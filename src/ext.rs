@@ -197,6 +197,7 @@ impl Ext {
             {
                 let child = &mut self.inodes[(child_ino - 1) as usize];
                 child.mode = mode_from_meta(&meta) as u16;
+                (child.uid, child.gid) = ownership_from_meta(&meta)?;
                 child.time = self.now;
             }
 
@@ -537,6 +538,24 @@ impl Ext {
     }
 }
 
+fn checked_ownership(uid: u32, gid: u32) -> anyhow::Result<(u16, u16)> {
+    Ok((
+        u16::try_from(uid).map_err(|_| anyhow::anyhow!("UID {uid} exceeds ext's 16-bit range"))?,
+        u16::try_from(gid).map_err(|_| anyhow::anyhow!("GID {gid} exceeds ext's 16-bit range"))?,
+    ))
+}
+
+#[cfg(unix)]
+fn ownership_from_meta(meta: &fs::Metadata) -> anyhow::Result<(u16, u16)> {
+    use std::os::unix::fs::MetadataExt;
+    checked_ownership(meta.uid(), meta.gid())
+}
+
+#[cfg(not(unix))]
+fn ownership_from_meta(_meta: &fs::Metadata) -> anyhow::Result<(u16, u16)> {
+    checked_ownership(0, 0)
+}
+
 #[cfg(unix)]
 fn mode_from_meta(meta: &fs::Metadata) -> u32 {
     use std::os::unix::fs::MetadataExt;
@@ -614,6 +633,34 @@ mod tests {
         let stats = ext.write_to(&img).unwrap();
         assert!(stats.free_blocks > 0);
         assert!(stats.free_inodes > 0);
+    }
+
+    #[test]
+    fn ownership_range_is_checked() {
+        assert_eq!(checked_ownership(65535, 65535).unwrap(), (65535, 65535));
+        assert!(checked_ownership(65536, 0).is_err());
+        assert!(checked_ownership(0, 65536).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn imported_setuid_file_keeps_its_owner() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let src = TempDir::new().unwrap();
+        let path = src.path().join("file");
+        fs::write(&path, b"data").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o6755)).unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        let mut ext = Ext::new(1).unwrap();
+        ext.populate_root(src.path()).unwrap();
+        let dst = TempDir::new().unwrap();
+        let image = dst.path().join("image");
+        ext.write_to(&image).unwrap();
+        let bytes = fs::read(image).unwrap();
+        let off = 2 * BLOCK_SIZE + INODE_SIZE;
+        assert_eq!(read_u16_le(&bytes, off), meta.mode() as u16);
+        assert_eq!(u32::from(read_u16_le(&bytes, off + 2)), meta.uid());
+        assert_eq!(u32::from(read_u16_le(&bytes, off + 12)), meta.gid());
     }
 
     // (No name-too-long smoke test here: NAME_LEN equals the typical host
