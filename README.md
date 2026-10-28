@@ -14,7 +14,7 @@ superseded by ext2 in 1993. Modern kernels can still mount it via the
 From crates.io (requires Rust 1.85 or newer):
 
 ```bash
-cargo install mkfs-ext
+cargo install --locked mkfs-ext
 ```
 
 This installs a binary called `mkfs-ext`. Pre-built binaries for Linux
@@ -40,6 +40,7 @@ sudo mount -o loop,ro -t ext out.ext /mnt
 
 - Imported modification times must fit ext's unsigned 32-bit Unix timestamp.
 - Unix imports preserve ownership and hard links between imported files.
+  UID and GID values above 65535 are rejected because ext stores 16-bit IDs.
 - Only regular files and directories can be imported; symlinks and special
   files are rejected with an error.
 - Filenames up to 255 bytes.

@@ -833,6 +833,16 @@ mod tests {
         let seconds = 1_000_000_000;
         file.set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds)))
             .unwrap();
+        #[cfg(unix)]
+        for (path, seconds) in [
+            (src.path().to_path_buf(), 900_000_000),
+            (src.path().join("sub"), 950_000_000),
+        ] {
+            File::open(path)
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds)))
+                .unwrap();
+        }
         let root_time =
             ext_timestamp(fs::metadata(src.path()).unwrap().modified().unwrap()).unwrap();
         let sub_time = ext_timestamp(
