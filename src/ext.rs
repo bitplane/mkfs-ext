@@ -36,6 +36,7 @@ const DIR_PAD: u16 = 8;
 const INODES_PER_BLOCK: u32 = (BLOCK_SIZE / 64) as u32; // 16
 const PTRS_PER_BLOCK: u32 = (BLOCK_SIZE / 4) as u32; // 256
 const DIRECT_BLOCKS: usize = 9;
+const MAX_FILE_SIZE: usize = (DIRECT_BLOCKS + PTRS_PER_BLOCK as usize) * BLOCK_SIZE;
 const INODE_SIZE: usize = 64;
 const FREE_BLOCK_ENTRIES: usize = 254;
 const FREE_INODE_ENTRIES: usize = 14;
@@ -259,10 +260,16 @@ impl Ext {
 
     fn write_file_data(&mut self, ino: u32, path: &Path) -> anyhow::Result<()> {
         let mut data = Vec::new();
-        File::open(path)?.read_to_end(&mut data)?;
-        let size = u32::try_from(data.len())
-            .map_err(|_| anyhow::anyhow!("file exceeds 4 GB: {}", path.display()))?;
-        self.inodes[(ino - 1) as usize].size = size;
+        File::open(path)?
+            .take(MAX_FILE_SIZE as u64 + 1)
+            .read_to_end(&mut data)?;
+        if data.len() > MAX_FILE_SIZE {
+            anyhow::bail!(
+                "file too large (max {MAX_FILE_SIZE} bytes): {}",
+                path.display()
+            );
+        }
+        self.inodes[(ino - 1) as usize].size = data.len() as u32;
 
         let mut indirect = [0u32; PTRS_PER_BLOCK as usize];
         let mut have_indirect = false;
@@ -778,6 +785,32 @@ mod tests {
         let dir = find_entry(&ext, ROOT_INO, name.as_bytes());
         let file = find_entry(&ext, dir, b"file\xfe");
         assert_eq!(ext.inodes[(file - 1) as usize].size, 5);
+    }
+
+    #[test]
+    fn file_size_limit_is_checked_before_allocating_blocks() {
+        let src = TempDir::new().unwrap();
+        let path = src.path().join("file");
+        let file = File::create(&path).unwrap();
+        for size in [MAX_FILE_SIZE as u64 + 1, 32 * 1024 * 1024] {
+            file.set_len(size).unwrap();
+            let mut ext = Ext::new(1).unwrap();
+            let next_block = ext.next_block;
+            let error = ext.populate_root(src.path()).unwrap_err();
+            assert!(error.to_string().contains("file too large"));
+            assert_eq!(ext.next_block, next_block);
+        }
+        file.set_len(MAX_FILE_SIZE as u64).unwrap();
+        let mut ext = Ext::new(1).unwrap();
+        ext.populate_root(src.path()).unwrap();
+        let ino = find_entry(&ext, ROOT_INO, b"file");
+        let inode = ext.inodes[(ino - 1) as usize];
+        assert_eq!(inode.size as usize, MAX_FILE_SIZE);
+        assert_ne!(inode.zone[9], 0);
+        assert_ne!(
+            read_u32_le(&ext.image, inode.zone[9] as usize * BLOCK_SIZE + 255 * 4),
+            0
+        );
     }
 
     // (No name-too-long smoke test here: NAME_LEN equals the typical host
