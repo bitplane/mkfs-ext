@@ -21,6 +21,8 @@
 //! at 4 bytes each). Maximum file size is therefore (9 + 256) × 1024 ≈
 //! 265 KB.
 
+#[cfg(unix)]
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -103,6 +105,8 @@ pub struct Ext {
     next_block: u32,
     next_inode: u32,
     now: u32,
+    #[cfg(unix)]
+    source_inodes: HashMap<(u64, u64), u32>,
 }
 
 impl Ext {
@@ -155,6 +159,8 @@ impl Ext {
             next_block: first_data_zone,
             next_inode: ROOT_INO + 1,
             now,
+            #[cfg(unix)]
+            source_inodes: HashMap::new(),
         };
 
         // Set up root inode and its initial directory block.
@@ -193,6 +199,26 @@ impl Ext {
                 anyhow::bail!("unsupported file type: {}", path.display());
             }
 
+            #[cfg(unix)]
+            let source_id = {
+                use std::os::unix::fs::MetadataExt;
+                (meta.dev(), meta.ino())
+            };
+            #[cfg(unix)]
+            if meta.is_file() {
+                if let Some(&ino) = self.source_inodes.get(&source_id) {
+                    let links = self.inodes[(ino - 1) as usize]
+                        .nlinks
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("too many hard links: {}", path.display())
+                        })?;
+                    self.add_dir_entry(dir_ino, name, ino)?;
+                    self.inodes[(ino - 1) as usize].nlinks = links;
+                    continue;
+                }
+            }
+
             let child_ino = self.alloc_inode()?;
             {
                 let child = &mut self.inodes[(child_ino - 1) as usize];
@@ -217,6 +243,8 @@ impl Ext {
                 self.inodes[(child_ino - 1) as usize].nlinks = 1;
                 self.add_dir_entry(dir_ino, name, child_ino)?;
                 self.write_file_data(child_ino, &path)?;
+                #[cfg(unix)]
+                self.source_inodes.insert(source_id, child_ino);
             }
         }
         Ok(())
@@ -684,6 +712,45 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unsupported file type"));
+    }
+
+    fn find_entry(ext: &Ext, dir: u32, name: &[u8]) -> u32 {
+        let inode = ext.inodes[(dir - 1) as usize];
+        for &block in &inode.zone[..inode.size as usize / BLOCK_SIZE] {
+            let mut off = block as usize * BLOCK_SIZE;
+            let end = off + BLOCK_SIZE;
+            while off < end {
+                let len = read_u16_le(&ext.image, off + 6) as usize;
+                if &ext.image[off + 8..off + 8 + len] == name {
+                    return read_u32_le(&ext.image, off);
+                }
+                off += read_u16_le(&ext.image, off + 4) as usize;
+            }
+        }
+        panic!("entry not found: {name:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_links_share_data_and_count_only_imported_names() {
+        let src = TempDir::new().unwrap();
+        fs::create_dir(src.path().join("sub")).unwrap();
+        let original = src.path().join("file");
+        fs::write(&original, b"payload").unwrap();
+        fs::hard_link(&original, src.path().join("sub/link")).unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::hard_link(&original, outside.path().join("not-imported")).unwrap();
+        let mut ext = Ext::new(1).unwrap();
+        ext.populate_root(src.path()).unwrap();
+        let file = find_entry(&ext, ROOT_INO, b"file");
+        let sub = find_entry(&ext, ROOT_INO, b"sub");
+        assert_eq!(file, find_entry(&ext, sub, b"link"));
+        let inode = ext.inodes[(file - 1) as usize];
+        assert_eq!(inode.nlinks, 2);
+        assert_eq!(inode.size, 7);
+        assert_eq!(ext.inode_used.iter().filter(|&&used| used).count(), 3);
+        let off = inode.zone[0] as usize * BLOCK_SIZE;
+        assert_eq!(&ext.image[off..off + 7], b"payload");
     }
 
     // (No name-too-long smoke test here: NAME_LEN equals the typical host

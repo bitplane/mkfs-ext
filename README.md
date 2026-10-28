@@ -38,6 +38,7 @@ sudo mount -o loop,ro -t ext out.ext /mnt
 
 ## Limits
 
+- Unix imports preserve ownership and hard links between imported files.
 - Only regular files and directories can be imported; symlinks and special
   files are rejected with an error.
 - Filenames up to 255 bytes.
