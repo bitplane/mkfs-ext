@@ -21,6 +21,7 @@
 //! at 4 bytes each). Maximum file size is therefore (9 + 256) × 1024 ≈
 //! 265 KB.
 
+use anyhow::Context;
 #[cfg(unix)]
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -178,17 +179,62 @@ impl Ext {
     }
 
     pub fn populate_root(&mut self, src: &Path) -> anyhow::Result<()> {
-        self.populate_dir(ROOT_INO, src)
+        #[cfg(unix)]
+        let dir = File::from(
+            rustix::fs::open(
+                src,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .with_context(|| format!("opening source directory {}", src.display()))?,
+        );
+        self.populate_dir(
+            ROOT_INO,
+            src,
+            #[cfg(unix)]
+            dir,
+        )
     }
 
-    fn populate_dir(&mut self, dir_ino: u32, src_path: &Path) -> anyhow::Result<()> {
-        self.inodes[(dir_ino - 1) as usize].time =
-            ext_timestamp(fs::metadata(src_path)?.modified()?)?;
-        for entry in fs::read_dir(src_path)? {
+    fn populate_dir(
+        &mut self,
+        dir_ino: u32,
+        src_path: &Path,
+        #[cfg(unix)] dir: File,
+    ) -> anyhow::Result<()> {
+        #[cfg(unix)]
+        let meta = dir.metadata()?;
+        #[cfg(not(unix))]
+        let meta = fs::metadata(src_path)?;
+        self.inodes[(dir_ino - 1) as usize].time = ext_timestamp(meta.modified()?)?;
+        #[cfg(unix)]
+        let entries = rustix::fs::Dir::read_from(&dir)?;
+        #[cfg(not(unix))]
+        let entries = fs::read_dir(src_path)?;
+        for entry in entries {
             let entry = entry?;
-            let path = entry.path();
-            let meta = fs::symlink_metadata(&path)?;
+            #[cfg(unix)]
+            let raw_name = {
+                use std::os::unix::ffi::OsStrExt;
+                let name = entry.file_name().to_bytes();
+                if name == b"." || name == b".." {
+                    continue;
+                }
+                std::ffi::OsStr::from_bytes(name).to_os_string()
+            };
+            #[cfg(not(unix))]
             let raw_name = entry.file_name();
+            let path = src_path.join(&raw_name);
+            #[cfg(unix)]
+            let source = open_source_entry(&dir, &raw_name)
+                .with_context(|| format!("importing {}", path.display()))?;
+            #[cfg(unix)]
+            let meta = source.metadata()?;
+            #[cfg(not(unix))]
+            let meta = fs::symlink_metadata(&path)?;
             #[cfg(unix)]
             let name = {
                 use std::os::unix::ffi::OsStrExt;
@@ -246,11 +292,18 @@ impl Ext {
                 self.init_dir_block(block, child_ino, dir_ino);
                 self.add_dir_entry(dir_ino, name, child_ino)?;
                 self.inodes[(dir_ino - 1) as usize].nlinks += 1;
-                self.populate_dir(child_ino, &path)?;
+                self.populate_dir(
+                    child_ino,
+                    &path,
+                    #[cfg(unix)]
+                    source,
+                )?;
             } else {
                 self.inodes[(child_ino - 1) as usize].nlinks = 1;
                 self.add_dir_entry(dir_ino, name, child_ino)?;
-                self.write_file_data(child_ino, &path)?;
+                #[cfg(not(unix))]
+                let source = File::open(&path)?;
+                self.write_file_data(child_ino, source, &path)?;
                 #[cfg(unix)]
                 self.source_inodes.insert(source_id, child_ino);
             }
@@ -258,9 +311,9 @@ impl Ext {
         Ok(())
     }
 
-    fn write_file_data(&mut self, ino: u32, path: &Path) -> anyhow::Result<()> {
+    fn write_file_data(&mut self, ino: u32, source: File, path: &Path) -> anyhow::Result<()> {
         let mut data = Vec::new();
-        File::open(path)?
+        source
             .take(MAX_FILE_SIZE as u64 + 1)
             .read_to_end(&mut data)?;
         if data.len() > MAX_FILE_SIZE {
@@ -580,6 +633,44 @@ impl Ext {
     }
 }
 
+// Resolve each child relative to a pinned directory, never through a path
+// whose ancestors could have been replaced while walking the source tree.
+#[cfg(unix)]
+fn open_source_entry(dir: &File, name: &std::ffi::OsStr) -> anyhow::Result<File> {
+    use rustix::fs::{statat, AtFlags};
+    let expected = statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    open_checked_source(dir, name, &expected)
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)] // stat field widths differ between Unix targets.
+fn open_checked_source(
+    dir: &File,
+    name: &std::ffi::OsStr,
+    expected: &rustix::fs::Stat,
+) -> anyhow::Result<File> {
+    use rustix::fs::{openat, FileType, Mode, OFlags};
+    use std::os::unix::fs::MetadataExt;
+    let kind = FileType::from_raw_mode(expected.st_mode);
+    if kind != FileType::RegularFile && kind != FileType::Directory {
+        anyhow::bail!("unsupported file type: {name:?}");
+    }
+    let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    if kind == FileType::Directory {
+        flags |= OFlags::DIRECTORY;
+    }
+    let file = File::from(openat(dir, name, flags, Mode::empty())?);
+    let actual = file.metadata()?;
+    if actual.dev() != expected.st_dev as u64
+        || actual.ino() != expected.st_ino as u64
+        || (actual.is_file() != (kind == FileType::RegularFile))
+        || (actual.is_dir() != (kind == FileType::Directory))
+    {
+        anyhow::bail!("source entry changed while opening: {name:?}");
+    }
+    Ok(file)
+}
+
 fn ext_timestamp(time: SystemTime) -> anyhow::Result<u32> {
     let seconds = time
         .duration_since(UNIX_EPOCH)
@@ -725,16 +816,16 @@ mod tests {
         assert!(ext
             .populate_root(src.path())
             .unwrap_err()
-            .to_string()
-            .contains("unsupported file type"));
+            .chain()
+            .any(|cause| cause.to_string().contains("unsupported file type")));
         fs::remove_file(&path).unwrap();
         let _socket = UnixListener::bind(&path).unwrap();
         let mut ext = Ext::new(1).unwrap();
         assert!(ext
             .populate_root(src.path())
             .unwrap_err()
-            .to_string()
-            .contains("unsupported file type"));
+            .chain()
+            .any(|cause| cause.to_string().contains("unsupported file type")));
     }
 
     fn find_entry(ext: &Ext, dir: u32, name: &[u8]) -> u32 {
@@ -881,6 +972,59 @@ mod tests {
             u32::MAX
         );
         assert!(ext_timestamp(UNIX_EPOCH + Duration::from_secs(u32::MAX as u64 + 1)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_source_entries_are_rejected_without_reading_or_blocking() {
+        use rustix::fs::{statat, AtFlags, FileType, Mode};
+        use std::ffi::OsStr;
+        use std::os::unix::fs::symlink;
+        let src = TempDir::new().unwrap();
+        let dir = File::open(src.path()).unwrap();
+        let name = OsStr::new("file");
+        let path = src.path().join(name);
+        fs::write(&path, b"original").unwrap();
+        let expected = statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        // Keep the original inode alive so its number cannot be reused.
+        fs::rename(&path, src.path().join("original")).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        assert!(open_checked_source(&dir, name, &expected).is_err());
+        fs::remove_file(&path).unwrap();
+        symlink("original", &path).unwrap();
+        assert!(open_checked_source(&dir, name, &expected).is_err());
+        fs::remove_file(&path).unwrap();
+        rustix::fs::mknodat(&dir, name, FileType::Fifo, Mode::RUSR | Mode::WUSR, 0).unwrap();
+        // O_NONBLOCK makes opening the substituted FIFO return immediately.
+        assert!(open_checked_source(&dir, name, &expected).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_handles_survive_path_replacement() {
+        use std::ffi::OsStr;
+        use std::os::unix::fs::symlink;
+        let src = TempDir::new().unwrap();
+        let path = src.path().join("source");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("file"), b"original").unwrap();
+        let dir = File::open(&path).unwrap();
+        let mut file = open_source_entry(&dir, OsStr::new("file")).unwrap();
+        let outside = src.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("file"), b"secret").unwrap();
+        fs::rename(&path, src.path().join("moved")).unwrap();
+        symlink(&outside, &path).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"original");
+        // Recursion must use the already-open directory, not its replaced path.
+        let mut ext = Ext::new(1).unwrap();
+        ext.populate_dir(ROOT_INO, &path, dir).unwrap();
+        let ino = find_entry(&ext, ROOT_INO, b"file");
+        let inode = ext.inodes[(ino - 1) as usize];
+        let off = inode.zone[0] as usize * BLOCK_SIZE;
+        assert_eq!(&ext.image[off..off + inode.size as usize], b"original");
     }
 
     // (No name-too-long smoke test here: NAME_LEN equals the typical host
