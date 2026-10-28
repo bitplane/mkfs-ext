@@ -11,7 +11,7 @@ superseded by ext2 in 1993. Modern kernels can still mount it via the
 
 ## Install
 
-From crates.io:
+From crates.io (requires Rust 1.85 or newer):
 
 ```bash
 cargo install mkfs-ext
