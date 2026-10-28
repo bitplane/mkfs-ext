@@ -105,7 +105,6 @@ pub struct Ext {
     block_used: Vec<bool>,
     next_block: u32,
     next_inode: u32,
-    now: u32,
     #[cfg(unix)]
     source_inodes: HashMap<(u64, u64), u32>,
 }
@@ -159,7 +158,6 @@ impl Ext {
             block_used,
             next_block: first_data_zone,
             next_inode: ROOT_INO + 1,
-            now,
             #[cfg(unix)]
             source_inodes: HashMap::new(),
         };
@@ -184,6 +182,8 @@ impl Ext {
     }
 
     fn populate_dir(&mut self, dir_ino: u32, src_path: &Path) -> anyhow::Result<()> {
+        self.inodes[(dir_ino - 1) as usize].time =
+            ext_timestamp(fs::metadata(src_path)?.modified()?)?;
         for entry in fs::read_dir(src_path)? {
             let entry = entry?;
             let path = entry.path();
@@ -232,7 +232,7 @@ impl Ext {
                 let child = &mut self.inodes[(child_ino - 1) as usize];
                 child.mode = mode_from_meta(&meta) as u16;
                 (child.uid, child.gid) = ownership_from_meta(&meta)?;
-                child.time = self.now;
+                child.time = ext_timestamp(meta.modified()?)?;
             }
 
             if meta.is_dir() {
@@ -580,6 +580,15 @@ impl Ext {
     }
 }
 
+fn ext_timestamp(time: SystemTime) -> anyhow::Result<u32> {
+    let seconds = time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| anyhow::anyhow!("modification time precedes the Unix epoch"))?
+        .as_secs();
+    u32::try_from(seconds)
+        .map_err(|_| anyhow::anyhow!("modification time exceeds ext's 32-bit range"))
+}
+
 fn checked_ownership(uid: u32, gid: u32) -> anyhow::Result<(u16, u16)> {
     Ok((
         u16::try_from(uid).map_err(|_| anyhow::anyhow!("UID {uid} exceeds ext's 16-bit range"))?,
@@ -811,6 +820,57 @@ mod tests {
             read_u32_le(&ext.image, inode.zone[9] as usize * BLOCK_SIZE + 255 * 4),
             0
         );
+    }
+
+    #[test]
+    fn imported_modification_times_are_preserved() {
+        use std::fs::FileTimes;
+        use std::time::Duration;
+        let src = TempDir::new().unwrap();
+        fs::create_dir(src.path().join("sub")).unwrap();
+        let path = src.path().join("sub/file");
+        let file = File::create(&path).unwrap();
+        let seconds = 1_000_000_000;
+        file.set_times(FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(seconds)))
+            .unwrap();
+        let root_time =
+            ext_timestamp(fs::metadata(src.path()).unwrap().modified().unwrap()).unwrap();
+        let sub_time = ext_timestamp(
+            fs::metadata(src.path().join("sub"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut ext = Ext::new(1).unwrap();
+        ext.populate_root(src.path()).unwrap();
+        let sub = find_entry(&ext, ROOT_INO, b"sub");
+        let ino = find_entry(&ext, sub, b"file");
+        let dst = TempDir::new().unwrap();
+        let image = dst.path().join("image");
+        ext.write_to(&image).unwrap();
+        let bytes = fs::read(image).unwrap();
+        for (ino, expected) in [
+            (ROOT_INO, root_time),
+            (sub, sub_time),
+            (ino, seconds as u32),
+        ] {
+            assert_eq!(
+                read_u32_le(&bytes, 2 * BLOCK_SIZE + (ino as usize - 1) * INODE_SIZE + 8),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn unrepresentable_modification_times_are_rejected() {
+        use std::time::Duration;
+        assert!(ext_timestamp(UNIX_EPOCH - Duration::from_secs(1)).is_err());
+        assert_eq!(
+            ext_timestamp(UNIX_EPOCH + Duration::from_secs(u32::MAX as u64)).unwrap(),
+            u32::MAX
+        );
+        assert!(ext_timestamp(UNIX_EPOCH + Duration::from_secs(u32::MAX as u64 + 1)).is_err());
     }
 
     // (No name-too-long smoke test here: NAME_LEN equals the typical host
