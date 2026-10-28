@@ -38,6 +38,8 @@ sudo mount -o loop,ro -t ext out.ext /mnt
 
 ## Limits
 
+- Only regular files and directories can be imported; symlinks and special
+  files are rejected with an error.
 - Filenames up to 255 bytes.
 - 9 direct + 1 single-indirect zone slots → max file ≈ 265 KB.
 - Directories are direct-only (no indirect for directory blocks).

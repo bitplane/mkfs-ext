@@ -190,7 +190,7 @@ impl Ext {
                 anyhow::bail!("name too long (max {NAME_LEN}): {name}");
             }
             if !meta.is_file() && !meta.is_dir() {
-                continue;
+                anyhow::bail!("unsupported file type: {}", path.display());
             }
 
             let child_ino = self.alloc_inode()?;
@@ -661,6 +661,29 @@ mod tests {
         assert_eq!(read_u16_le(&bytes, off), meta.mode() as u16);
         assert_eq!(u32::from(read_u16_le(&bytes, off + 2)), meta.uid());
         assert_eq!(u32::from(read_u16_le(&bytes, off + 12)), meta.gid());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_entries_are_rejected() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+        let src = TempDir::new().unwrap();
+        let path = src.path().join("unsupported");
+        symlink("missing", &path).unwrap();
+        let mut ext = Ext::new(1).unwrap();
+        assert!(ext
+            .populate_root(src.path())
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported file type"));
+        fs::remove_file(&path).unwrap();
+        let _socket = UnixListener::bind(&path).unwrap();
+        let mut ext = Ext::new(1).unwrap();
+        assert!(ext
+            .populate_root(src.path())
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported file type"));
     }
 
     // (No name-too-long smoke test here: NAME_LEN equals the typical host
