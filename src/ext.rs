@@ -30,6 +30,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const BLOCK_SIZE: usize = 1024;
+const MAX_IMAGE_MB: u32 = 512;
 pub const MAGIC: u16 = 0x137D;
 const ROOT_INO: u32 = 1;
 const NAME_LEN: usize = 255;
@@ -112,10 +113,8 @@ pub struct Ext {
 
 impl Ext {
     pub fn new(size_mb: u32) -> anyhow::Result<Self> {
-        if size_mb == 0 {
-            anyhow::bail!("size must be positive");
-        }
-        let bytes = u64::from(size_mb) * 1024 * 1024;
+        let image_len = checked_image_len(size_mb)?;
+        let bytes = image_len as u64;
         if bytes / BLOCK_SIZE as u64 > u64::from(u32::MAX) {
             anyhow::bail!("filesystem exceeds 32-bit block-number limit");
         }
@@ -141,20 +140,20 @@ impl Ext {
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0);
 
-        let mut block_used = vec![false; total_blocks as usize];
+        let mut block_used = try_filled_vec(total_blocks as usize, false)?;
         for slot in block_used.iter_mut().take(first_data_zone as usize) {
             *slot = true;
         }
 
-        let mut inode_used = vec![false; (ninodes + 1) as usize];
+        let mut inode_used = try_filled_vec((ninodes + 1) as usize, false)?;
         inode_used[ROOT_INO as usize] = true;
 
         let mut ext = Self {
-            image: vec![0u8; bytes as usize],
+            image: try_filled_vec(image_len, 0u8)?,
             total_blocks,
             ninodes,
             first_data_zone,
-            inodes: vec![Inode::zero(); ninodes as usize],
+            inodes: try_filled_vec(ninodes as usize, Inode::zero())?,
             inode_used,
             block_used,
             next_block: first_data_zone,
@@ -633,6 +632,31 @@ impl Ext {
     }
 }
 
+fn checked_image_len(size_mb: u32) -> anyhow::Result<usize> {
+    if size_mb == 0 {
+        anyhow::bail!("size must be positive");
+    }
+    let bytes = u64::from(size_mb) * 1024 * 1024;
+    let len = usize::try_from(bytes)
+        .map_err(|_| anyhow::anyhow!("image size exceeds the host address space"))?;
+    if len > isize::MAX as usize {
+        anyhow::bail!("image size exceeds the host allocation limit");
+    }
+    if size_mb > MAX_IMAGE_MB {
+        anyhow::bail!("image too large (max {MAX_IMAGE_MB} MiB for this in-memory writer)");
+    }
+    Ok(len)
+}
+
+fn try_filled_vec<T: Clone>(len: usize, value: T) -> anyhow::Result<Vec<T>> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(len)
+        .context("not enough memory to allocate filesystem image or metadata")?;
+    values.resize(len, value);
+    Ok(values)
+}
+
 // Resolve each child relative to a pinned directory, never through a path
 // whose ancestors could have been replaced while walking the source tree.
 #[cfg(unix)]
@@ -1025,6 +1049,21 @@ mod tests {
         let inode = ext.inodes[(ino - 1) as usize];
         let off = inode.zone[0] as usize * BLOCK_SIZE;
         assert_eq!(&ext.image[off..off + inode.size as usize], b"original");
+    }
+
+    #[test]
+    fn image_size_limits_are_checked_before_allocation() {
+        assert_eq!(checked_image_len(1).unwrap(), 1024 * 1024);
+        assert_eq!(checked_image_len(MAX_IMAGE_MB).unwrap(), 512 * 1024 * 1024);
+        for size in [0, MAX_IMAGE_MB + 1, 2048, 4096, 100_000, u32::MAX] {
+            assert!(Ext::new(size).is_err(), "accepted {size} MiB");
+        }
+    }
+
+    #[test]
+    fn allocation_failure_is_reported_instead_of_panicking() {
+        let error = try_filled_vec(usize::MAX, 0u8).unwrap_err();
+        assert!(error.to_string().contains("not enough memory"));
     }
 
     // (No name-too-long smoke test here: NAME_LEN equals the typical host

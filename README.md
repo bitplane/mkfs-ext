@@ -38,6 +38,9 @@ sudo mount -o loop,ro -t ext out.ext /mnt
 
 ## Limits
 
+- Images are built in memory and limited to 512 MiB; allow additional RAM
+  for inode and allocation metadata. Allocation failures are reported as errors.
+
 - Imported modification times must fit ext's unsigned 32-bit Unix timestamp.
 - Unix imports preserve ownership and hard links between imported files.
   UID and GID values above 65535 are rejected because ext stores 16-bit IDs.
